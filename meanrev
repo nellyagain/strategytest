@@ -1,0 +1,666 @@
+//@version=5
+indicator("Undercut & Reclaim [Pro V18: AVWAP Pullback]", overlay=true, shorttitle="U&R Pro V18", max_lines_count=500, max_labels_count=500)
+
+// ==========================================
+// 1. INPUTS
+// ==========================================
+
+// --- Structure & Timeframe ---
+group_struct = "Structure Definition"
+string STRUCT_TIP = "AVWAP Pullback: Uses anchored VWAP as the structure level. Price undercutting and reclaiming VWAP triggers signals."
+structMode   = input.string("Rolling Lowest", title="Structure Mode", options=["Rolling Lowest", "Swing Pivot", "HTF Support", "AVWAP Pullback"], group=group_struct, tooltip=STRUCT_TIP)
+useHybrid    = input.bool(true, title="Hybrid Mode (Pivot Lag Fix)", group=group_struct)
+htfFrame     = input.timeframe("D", title="HTF Selection (if HTF Mode)", group=group_struct)
+lookbackLen  = input.int(5, title="Rolling Lookback / Pivot Left", minval=2, group=group_struct)
+pivotRight   = input.int(2, title="Pivot Right Bars", minval=1, group=group_struct)
+timeoutBars  = input.int(10, title="Reclaim Timeout (Bars)", minval=1, group=group_struct)
+
+// --- AVWAP Pullback Mode Inputs ---
+group_avwap_pb = "AVWAP Pullback Mode"
+string ANCHOR_TIP = "Manual Date: Pick specific anchor date. Auto methods detect significant events automatically."
+avwapAnchorMethod = input.string("Manual Date", title="Anchor Method", options=["Manual Date", "Auto: Earnings Gap", "Auto: Volume Spike", "Auto: Breakout Day", "Auto: Pivot Low"], group=group_avwap_pb, tooltip=ANCHOR_TIP)
+manualAnchorDate  = input.time(timestamp("2024-01-01 00:00"), title="Manual Anchor Date", group=group_avwap_pb)
+autoLookback      = input.int(60, title="Auto-Detect Lookback (Bars)", minval=20, maxval=250, group=group_avwap_pb)
+gapThreshold      = input.float(3.0, title="Gap Threshold %", step=0.5, group=group_avwap_pb, tooltip="For Earnings Gap - minimum gap size")
+volSpikeMultiple  = input.float(2.5, title="Volume Spike Multiple", step=0.1, group=group_avwap_pb, tooltip="Volume must exceed avg by this multiple")
+breakoutLookback  = input.int(20, title="Breakout Range Lookback", minval=5, group=group_avwap_pb, tooltip="Bars to define prior range")
+avwapUndercutPct  = input.float(0.3, title="Min AVWAP Undercut %", step=0.1, group=group_avwap_pb, tooltip="Price must breach AVWAP by at least this %")
+showAvwapBands    = input.bool(false, title="Show VWAP StdDev Bands?", group=group_avwap_pb)
+bandMult          = input.float(1.0, title="Band Multiplier", step=0.25, group=group_avwap_pb)
+
+// --- Quality Guards (Wick & Depth) ---
+group_guard  = "Quality Guards (Depth & Wick)"
+useDepth     = input.bool(false, title="Filter Undercut Depth?", group=group_guard)
+minUndPct    = input.float(0.1, title="Min Undercut %", step=0.1, group=group_guard)
+maxUndPct    = input.float(5.0, title="Max Undercut %", step=0.1, group=group_guard)
+
+useWickGuard    = input.bool(false, title="Use Wick Severity Guard?", group=group_guard)
+useWickRange    = input.bool(false, title="Measure Wick vs Bar Range? (Default=Floor)", group=group_guard)
+minWickPct      = input.float(0.3, title="Min Wick % (of Floor)", step=0.1, group=group_guard)
+minWickRangePct = input.float(30.0, title="Min Wick % (of Bar Range)", step=1.0, group=group_guard)
+useAdaptiveWick = input.bool(false, title="Adaptive Wick (Scale by ATR)?", group=group_guard)
+atrLenW         = input.int(14, title="ATR Len (Adaptive)", group=group_guard)
+
+// --- Trend Inputs ---
+group_trend  = "Trend Filtering"
+useMaFilter  = input.bool(true, title="Use Trend Filter?", group=group_trend)
+maLen        = input.int(50, title="MA Length", group=group_trend)
+slopeBars    = input.int(5, title="MA Slope Lookback", minval=1, group=group_trend)
+
+// --- VWAP Inputs (for non-AVWAP modes) ---
+group_vwap      = "VWAP Logic (Standard Modes)"
+useVwap         = input.bool(true, title="Show Anchored VWAP?", group=group_vwap)
+vwapSource      = input.string("ohlc4", title="VWAP Source", options=["hlc3", "ohlc4", "close", "hl2"], group=group_vwap)
+vwapAnchorMode  = input.string("Undercut Low Bar", title="Anchor Point", options=["Undercut Start", "Undercut Low Bar"], group=group_vwap, tooltip="Undercut Start anchors from first breach. Undercut Low Bar anchors from deepest undercut bar.")
+reqVwapAbove    = input.bool(false, title="Require Close > VWAP?", group=group_vwap)
+useVwapStop     = input.bool(false, title="Use VWAP as Dynamic Stop?", group=group_vwap)
+vwapStopBuffer  = input.float(0.5, title="VWAP Stop Buffer %", step=0.1, group=group_vwap)
+showAnchorMark  = input.bool(true, title="Show Anchor Point Marker?", group=group_vwap)
+vwapDebug       = input.bool(false, title="Debug Mode?", group=group_vwap)
+
+// --- Confirmation Inputs ---
+group_conf      = "Confirmation Filters"
+confirmOnClose  = input.bool(false, title="Confirm Signal on Close?", group=group_conf)
+minCloseStr     = input.float(0.5, title="Min Close Strength (0-1)", group=group_conf)
+useFTDay        = input.bool(false, title="Require Follow-Through Day?", group=group_conf)
+reqVolContraction = input.bool(false, title="Require Vol Contraction Before Reclaim?", group=group_conf, tooltip="For AVWAP mode: volume should contract approaching VWAP")
+volContractionBars = input.int(3, title="Vol Contraction Lookback", minval=2, group=group_conf)
+
+// --- Volume Inputs ---
+group_vol       = "Volume Logic"
+volCombineMode  = input.string("ALL (AND)", title="Volume Combine Mode", options=["ALL (AND)", "ANY (OR)", "WEIGHTED"], group=group_vol)
+volWeightSimple = input.float(0.33, title="Weight: Simple %", step=0.01, group=group_vol)
+volWeightZ      = input.float(0.34, title="Weight: Z-Score", step=0.01, group=group_vol)
+volWeightCum    = input.float(0.33, title="Weight: Cumulative", step=0.01, group=group_vol)
+volWeightedThr  = input.float(0.5, title="Weighted Pass Threshold (0-1)", minval=0, maxval=1, step=0.05, group=group_vol)
+
+useVol          = input.bool(false, title="Enable Simple Vol Filter?", group=group_vol)
+volThresh       = input.float(100, title="Simple Vol Threshold %", minval=1, group=group_vol)
+volLookback     = input.int(20, title="Volume SMA Length", group=group_vol)
+useVolZ         = input.bool(false, title="Enable Z-Score Filter?", group=group_vol)
+minVolZ         = input.float(1.0, title="Min Vol Z-Score", step=0.1, group=group_vol)
+useCumVol       = input.bool(false, title="Enable Cumulative Vol?", group=group_vol)
+minCumVolMult   = input.float(1.0, title="Min CumVol Multiplier", step=0.1, group=group_vol)
+
+// --- Risk Management ---
+group_risk   = "Risk Management"
+stopMode     = input.string("Shakeout Low", title="Stop Loss Logic", options=["Shakeout Low", "ATR Based", "Structure Level", "AVWAP Level"], group=group_risk)
+stopBuffer   = input.float(0.05, title="Stop Buffer %", step=0.05, group=group_risk)
+atrLen       = input.int(14, title="ATR Length", group=group_risk)
+atrMult      = input.float(2.0, title="ATR Multiplier", step=0.1, group=group_risk)
+maxLineAge   = input.int(300, title="Max Line Age (Bars)", group=group_risk)
+
+
+// ==========================================
+// 2. MODE DETECTION
+// ==========================================
+isAvwapPullbackMode = structMode == "AVWAP Pullback"
+
+
+// ==========================================
+// 3. VWAP SOURCE
+// ==========================================
+vwapSrc = switch vwapSource
+    "hlc3"  => hlc3
+    "ohlc4" => ohlc4
+    "close" => close
+    "hl2"   => hl2
+    => ohlc4
+
+
+// ==========================================
+// 4. AVWAP PULLBACK: ANCHOR DETECTION
+// ==========================================
+
+// --- Manual Anchor ---
+isManualAnchorBar() =>
+    time >= manualAnchorDate and time[1] < manualAnchorDate
+
+// --- Auto: Earnings Gap (Largest Gap Up) ---
+findLargestGapBar(int lookback) =>
+    float maxGap = 0.0
+    int maxGapBar = na
+    for i = 0 to lookback - 1
+        gapPct = ((open[i] - close[i + 1]) / close[i + 1]) * 100
+        if gapPct > maxGap and gapPct >= gapThreshold
+            maxGap := gapPct
+            maxGapBar := bar_index - i
+    maxGapBar
+
+// --- Auto: Volume Spike ---
+findVolumeSpikeBar(int lookback) =>
+    float maxRatio = 0.0
+    int maxVolBar = na
+    for i = 0 to lookback - 1
+        localAvg = ta.sma(volume, 20)[i]
+        ratio = volume[i] / nz(localAvg, 1)
+        if ratio > maxRatio and ratio >= volSpikeMultiple and close[i] > open[i]
+            maxRatio := ratio
+            maxVolBar := bar_index - i
+    maxVolBar
+
+// --- Auto: Breakout Day ---
+findBreakoutBar(int lookback, int rangeBars) =>
+    int breakoutBar = na
+    for i = 0 to lookback - 1
+        priorHigh = ta.highest(high, rangeBars)[i + 1]
+        if close[i] > priorHigh and close[i] > open[i]
+            breakoutBar := bar_index - i
+            break
+    breakoutBar
+
+// --- Auto: Pivot Low ---
+findPivotLowBar(int lookback, int leftBars, int rightBars) =>
+    int pivotBar = na
+    for i = rightBars to lookback - 1
+        isPivot = true
+        pivotLow = low[i]
+        for j = 1 to leftBars
+            if low[i + j] <= pivotLow
+                isPivot := false
+                break
+        if isPivot
+            for j = 1 to rightBars
+                if low[i - j] <= pivotLow
+                    isPivot := false
+                    break
+        if isPivot
+            pivotBar := bar_index - i
+            break
+    pivotBar
+
+
+// ==========================================
+// 5. AVWAP PULLBACK: STATE & CALCULATION
+// ==========================================
+var int   avwapAnchorBarIdx  = na
+var float avwapAnchorPrice   = na
+var float avwapNum           = 0.0
+var float avwapDen           = 0.0
+var float avwapSumSqDev      = 0.0
+var float pullbackVwap       = na
+var float pullbackVwapStdDev = na
+var float pullbackUpperBand  = na
+var float pullbackLowerBand  = na
+var bool  avwapAnchorFound   = false
+var label avwapAnchorLabel   = na
+
+var bool  avwapUndercutActive = false
+var int   avwapUndercutBar    = na
+var float avwapUndercutLow    = na
+var float avwapAtUndercut     = na
+
+// Detect anchor bar
+if isAvwapPullbackMode and not avwapAnchorFound
+    int detectedAnchor = na
+    if avwapAnchorMethod == "Manual Date"
+        if isManualAnchorBar()
+            detectedAnchor := bar_index
+    else if avwapAnchorMethod == "Auto: Earnings Gap"
+        detectedAnchor := findLargestGapBar(autoLookback)
+    else if avwapAnchorMethod == "Auto: Volume Spike"
+        detectedAnchor := findVolumeSpikeBar(autoLookback)
+    else if avwapAnchorMethod == "Auto: Breakout Day"
+        detectedAnchor := findBreakoutBar(autoLookback, breakoutLookback)
+    else if avwapAnchorMethod == "Auto: Pivot Low"
+        detectedAnchor := findPivotLowBar(autoLookback, 5, 3)
+    
+    if not na(detectedAnchor) and bar_index == detectedAnchor
+        avwapAnchorFound   := true
+        avwapAnchorBarIdx  := bar_index
+        avwapAnchorPrice   := low
+        avwapNum           := vwapSrc * volume
+        avwapDen           := volume
+        avwapSumSqDev      := 0.0
+        if showAnchorMark
+            avwapAnchorLabel := label.new(bar_index, low, text="⚓ AVWAP", style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white, size=size.tiny)
+
+// Manual anchor initialization
+if isAvwapPullbackMode and avwapAnchorMethod == "Manual Date" and isManualAnchorBar() and not avwapAnchorFound
+    avwapAnchorFound   := true
+    avwapAnchorBarIdx  := bar_index
+    avwapAnchorPrice   := low
+    avwapNum           := vwapSrc * volume
+    avwapDen           := volume
+    avwapSumSqDev      := 0.0
+    if showAnchorMark
+        avwapAnchorLabel := label.new(bar_index, low, text="⚓ AVWAP", style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white, size=size.tiny)
+
+// Accumulate VWAP
+if isAvwapPullbackMode and avwapAnchorFound and bar_index > avwapAnchorBarIdx
+    avwapNum += vwapSrc * volume
+    avwapDen += volume
+    if avwapDen > 0
+        pullbackVwap := avwapNum / avwapDen
+        avwapSumSqDev += volume * math.pow(vwapSrc - pullbackVwap, 2)
+        pullbackVwapStdDev := math.sqrt(avwapSumSqDev / avwapDen)
+        pullbackUpperBand  := pullbackVwap + (pullbackVwapStdDev * bandMult)
+        pullbackLowerBand  := pullbackVwap - (pullbackVwapStdDev * bandMult)
+
+// AVWAP Pullback: Undercut detection
+avwapPullbackValid = isAvwapPullbackMode and avwapAnchorFound and not na(pullbackVwap) and pullbackVwap > 0
+avwapBreachDepth = avwapPullbackValid ? ((pullbackVwap - low) / pullbackVwap) * 100 : 0.0
+isAvwapUndercut = avwapPullbackValid and low < pullbackVwap and avwapBreachDepth >= avwapUndercutPct
+
+if isAvwapPullbackMode and isAvwapUndercut
+    if not avwapUndercutActive
+        avwapUndercutActive := true
+        avwapUndercutBar    := bar_index
+        avwapUndercutLow    := low
+        avwapAtUndercut     := pullbackVwap
+    else
+        if low < avwapUndercutLow
+            avwapUndercutLow := low
+
+// AVWAP Pullback: Timeout reset
+avwapExpired = avwapUndercutActive and not na(avwapUndercutBar) and (bar_index - avwapUndercutBar > timeoutBars)
+if avwapExpired
+    avwapUndercutActive := false
+    avwapUndercutBar    := na
+    avwapUndercutLow    := na
+
+
+// ==========================================
+// 6. STANDARD MODE: STRUCTURE LOGIC
+// ==========================================
+var float pivotFloor = na
+
+pl = ta.pivotlow(low, lookbackLen, pivotRight)
+if not na(pl)
+    pivotFloor := pl
+
+rollingFloor = ta.lowest(low, lookbackLen)[1]
+
+htfRaw = request.security(syminfo.tickerid, htfFrame, ta.lowest(low, lookbackLen), lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+htfFloor = htfRaw[1]
+
+activeFloorPivot = (na(pivotFloor) and useHybrid) ? rollingFloor : pivotFloor
+
+structureLow = switch structMode
+    "Swing Pivot"    => activeFloorPivot
+    "HTF Support"    => htfFloor
+    "Rolling Lowest" => rollingFloor
+    "AVWAP Pullback" => pullbackVwap
+    => rollingFloor
+
+
+// ==========================================
+// 7. STANDARD MODE: STATE VARIABLES
+// ==========================================
+var bool  undercutOccurred = false
+var int   undercutBar      = na
+var float undercutLow      = na
+var int   undercutLowBar   = na
+var float floorAtUndercut  = na
+var float cumVol           = 0.0
+var float maxWickPct       = 0.0
+var float maxWickRangePct  = 0.0
+
+// Standard VWAP State
+var float stdVwapNum       = 0.0
+var float stdVwapDen       = 0.0
+var float anchoredVwap     = na
+var int   vwapAnchorBar    = na
+var float vwapAnchorPriceStd = na
+var label vwapAnchorLabelStd = na
+var float vwapAtSignal     = na
+
+// Reset Logic (Standard modes only)
+floorChanged = not isAvwapPullbackMode and nz(structureLow[1]) != nz(structureLow)
+expired = not isAvwapPullbackMode and not na(undercutBar) and (bar_index - undercutBar > timeoutBars)
+
+if floorChanged or expired
+    undercutOccurred := false
+    undercutBar      := na
+    undercutLow      := na
+    undercutLowBar   := na
+    floorAtUndercut  := na
+    cumVol           := 0.0
+    maxWickPct       := 0.0
+    maxWickRangePct  := 0.0
+    stdVwapNum       := 0.0
+    stdVwapDen       := 0.0
+    anchoredVwap     := na
+    vwapAnchorBar    := na
+    vwapAnchorPriceStd := na
+    vwapAtSignal     := na
+    if not na(vwapAnchorLabelStd)
+        label.delete(vwapAnchorLabelStd)
+        vwapAnchorLabelStd := na
+
+structValid = not na(structureLow) and structureLow > 0
+
+
+// ==========================================
+// 8. STANDARD MODE: UNDERCUT DETECTION
+// ==========================================
+inUndercutZone = not isAvwapPullbackMode and structValid and low < structureLow
+
+if inUndercutZone
+    if not undercutOccurred
+        undercutOccurred := true
+        undercutBar      := bar_index
+        undercutLow      := low
+        undercutLowBar   := bar_index
+        floorAtUndercut  := structureLow
+        cumVol           := volume
+        stdVwapNum       := vwapSrc * volume
+        stdVwapDen       := volume
+        vwapAnchorBar    := bar_index
+        vwapAnchorPriceStd := low
+        if useVwap and showAnchorMark
+            if not na(vwapAnchorLabelStd)
+                label.delete(vwapAnchorLabelStd)
+            vwapAnchorLabelStd := label.new(bar_index, low, text="⚓", style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.white, size=size.tiny)
+    else
+        cumVol += volume
+        stdVwapNum += vwapSrc * volume
+        stdVwapDen += volume
+        
+        if low < undercutLow
+            undercutLow    := low
+            undercutLowBar := bar_index
+            if vwapAnchorMode == "Undercut Low Bar"
+                stdVwapNum       := vwapSrc * volume
+                stdVwapDen       := volume
+                vwapAnchorBar    := bar_index
+                vwapAnchorPriceStd := low
+                if useVwap and showAnchorMark
+                    if not na(vwapAnchorLabelStd)
+                        label.delete(vwapAnchorLabelStd)
+                    vwapAnchorLabelStd := label.new(bar_index, low, text="⚓", style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.white, size=size.tiny)
+
+    // Wick Calculations
+    lowerWick = math.max(math.min(open, close) - low, 0.0)
+    currentWickPct = (floorAtUndercut > 0) ? (lowerWick / floorAtUndercut) * 100 : 0.0
+    maxWickPct := math.max(maxWickPct, currentWickPct)
+    barRng = math.max(high - low, syminfo.mintick)
+    wickPctOfRange = (barRng > 0) ? (lowerWick / barRng) * 100 : 0.0
+    maxWickRangePct := math.max(maxWickRangePct, wickPctOfRange)
+
+else if undercutOccurred and not isAvwapPullbackMode
+    stdVwapNum += vwapSrc * volume
+    stdVwapDen += volume
+
+// Calculate Standard VWAP
+anchoredVwap := stdVwapDen > 0 ? stdVwapNum / stdVwapDen : na
+
+
+// ==========================================
+// 9. TRIGGER & GATES
+// ==========================================
+
+// --- Standard Mode Reclaim ---
+isReclaim = not isAvwapPullbackMode and undercutOccurred and structValid and close > floorAtUndercut
+
+// --- AVWAP Pullback Mode Reclaim ---
+isAvwapReclaim = isAvwapPullbackMode and avwapUndercutActive and avwapPullbackValid and close > pullbackVwap
+
+// --- Common Gates ---
+trendMA = ta.sma(close, maLen)
+maIsRising = trendMA > trendMA[slopeBars]
+trendOk = useMaFilter ? (close > trendMA and maIsRising) : true
+
+barRange = high - low
+closeStrength = (close - low) / (barRange == 0 ? 1 : barRange)
+isStrongClose = closeStrength >= minCloseStr
+
+// Volume contraction check (for AVWAP mode)
+volAvg20 = ta.sma(volume, 20)
+volContracted = true
+if reqVolContraction and volContractionBars > 0
+    for i = 1 to volContractionBars
+        if volume[i] > volAvg20[i]
+            volContracted := false
+            break
+volExpanding = volume > volAvg20
+avwapVolOk = not reqVolContraction or (volContracted and volExpanding)
+
+// --- Standard Mode Gates ---
+ftOk = useFTDay ? (bar_index > undercutBar and close > floorAtUndercut and close[1] > floorAtUndercut) : true
+
+depthCalc = (not na(floorAtUndercut) and floorAtUndercut > 0) ? ((floorAtUndercut - undercutLow) / floorAtUndercut) * 100 : 0.0
+depthOk   = useDepth ? (depthCalc >= minUndPct and depthCalc <= maxUndPct) : true
+
+atrW = ta.atr(atrLenW)
+volPct = (not na(floorAtUndercut) and floorAtUndercut > 0) ? (atrW / floorAtUndercut) * 100.0 : 0.0
+adjMinWickPct = useAdaptiveWick ? (minWickPct * (1.0 + 0.5 * volPct / 100.0)) : minWickPct
+
+wickOk = true
+if useWickGuard
+    if useWickRange
+        wickOk := maxWickRangePct >= minWickRangePct
+    else
+        wickOk := maxWickPct >= adjMinWickPct
+
+// VWAP Gate (Standard mode)
+vwapValid = not na(anchoredVwap) and anchoredVwap > 0
+vwapOk = reqVwapAbove ? (vwapValid and close > anchoredVwap) : true
+
+// Volume Logic
+volAvg = ta.sma(volume, volLookback)
+volReq = volAvg * (volThresh / 100)
+vSimple = useVol ? (volume > volReq) : na
+
+volStd = ta.stdev(volume, volLookback)
+volZ = (volStd > 0) ? ((volume - volAvg) / volStd) : 0.0
+vZ = useVolZ ? (volZ >= minVolZ) : na
+
+barsSinceUndercut = (undercutOccurred and not na(undercutBar)) ? (bar_index - undercutBar + 1) : 0
+cumVolEval = useCumVol ? (cumVol + (isReclaim ? volume : 0.0)) : na
+cumBaseline = volAvg * barsSinceUndercut * minCumVolMult
+vCum = useCumVol ? (barsSinceUndercut > 0 and cumVolEval >= cumBaseline) : na
+
+bool volOk = true
+if volCombineMode == "ALL (AND)"
+    volOk := nz(vSimple, true) and nz(vZ, true) and nz(vCum, true)
+else if volCombineMode == "ANY (OR)"
+    enabledCount = (useVol?1:0) + (useVolZ?1:0) + (useCumVol?1:0)
+    anyPass = (useVol and vSimple) or (useVolZ and vZ) or (useCumVol and vCum)
+    volOk := enabledCount == 0 ? true : anyPass
+else
+    score = (useVol ? (vSimple ? 1.0 : 0.0) * volWeightSimple : 0.0) + (useVolZ ? (vZ ? 1.0 : 0.0) * volWeightZ : 0.0) + (useCumVol ? (vCum ? 1.0 : 0.0) * volWeightCum : 0.0)
+    totalW = (useVol ? volWeightSimple : 0) + (useVolZ ? volWeightZ : 0) + (useCumVol ? volWeightCum : 0)
+    normScore = totalW > 0 ? score / totalW : 1.0
+    volOk := normScore >= volWeightedThr
+
+
+// ==========================================
+// 10. FINAL SIGNALS
+// ==========================================
+
+// Standard Mode Signal
+preSignalStd = isReclaim and trendOk and isStrongClose and volOk and depthOk and wickOk and ftOk and vwapOk
+signalStd = preSignalStd and (not confirmOnClose or barstate.isconfirmed)
+
+// AVWAP Pullback Mode Signal
+preSignalAvwap = isAvwapReclaim and trendOk and isStrongClose and avwapVolOk
+signalAvwap = preSignalAvwap and (not confirmOnClose or barstate.isconfirmed)
+
+// Combined signal
+signal = signalStd or signalAvwap
+
+// Capture VWAP before reset
+if signalStd
+    vwapAtSignal := anchoredVwap
+
+// Reset after Standard signal
+if signalStd
+    undercutOccurred := false
+    stdVwapNum       := 0.0
+    stdVwapDen       := 0.0
+    anchoredVwap     := na
+    vwapAnchorBar    := na
+    vwapAnchorPriceStd := na
+    if not na(vwapAnchorLabelStd)
+        label.delete(vwapAnchorLabelStd)
+        vwapAnchorLabelStd := na
+
+// Reset after AVWAP Pullback signal
+if signalAvwap
+    avwapUndercutActive := false
+    avwapUndercutBar    := na
+    avwapUndercutLow    := na
+
+
+// ==========================================
+// 11. RISK MANAGEMENT
+// ==========================================
+atrVal = ta.atr(atrLen)
+
+// Determine active VWAP for stop calculation
+activeVwap = isAvwapPullbackMode ? pullbackVwap : anchoredVwap
+activeUndercutLow = isAvwapPullbackMode ? avwapUndercutLow : undercutLow
+activeFloor = isAvwapPullbackMode ? pullbackVwap : floorAtUndercut
+
+baseStop = switch stopMode
+    "Shakeout Low"    => activeUndercutLow * (1 - stopBuffer / 100)
+    "ATR Based"       => close - (atrVal * atrMult)
+    "Structure Level" => activeFloor * (1 - stopBuffer / 100)
+    "AVWAP Level"     => activeVwap * (1 - vwapStopBuffer / 100)
+    => activeUndercutLow * (1 - stopBuffer / 100)
+
+vwapStopPrice = not na(activeVwap) ? activeVwap * (1 - vwapStopBuffer / 100) : na
+stopPrice = useVwapStop and not na(vwapStopPrice) ? vwapStopPrice : baseStop
+
+entryPrice  = close
+riskPct     = not na(stopPrice) and stopPrice > 0 ? ((entryPrice - stopPrice) / entryPrice) * 100 : 0.0
+closePctVal = closeStrength * 100
+
+
+// ==========================================
+// 12. VISUALS
+// ==========================================
+barcolor(signal ? color.new(color.blue, 0) : na)
+plot(not isAvwapPullbackMode and structMode != "Rolling Lowest" ? structureLow : na, title="Structure Floor", color=color.gray, style=plot.style_circles)
+
+// Debug background
+bgcolor(vwapDebug and not isAvwapPullbackMode and undercutOccurred ? (inUndercutZone ? color.new(color.red, 85) : color.new(color.orange, 85)) : na)
+bgcolor(isAvwapPullbackMode and avwapUndercutActive ? color.new(color.orange, 90) : na)
+
+// Standard VWAP line
+stdVwapColor = close > nz(anchoredVwap, close) ? color.new(color.teal, 0) : color.new(color.orange, 0)
+plot(useVwap and not isAvwapPullbackMode and undercutOccurred ? anchoredVwap : na, "Anchored VWAP (Std)", color=stdVwapColor, style=plot.style_linebr, linewidth=2)
+
+// AVWAP Pullback VWAP line
+avwapColor = close > nz(pullbackVwap, close) ? color.new(color.teal, 0) : color.new(color.red, 30)
+plot(isAvwapPullbackMode and avwapPullbackValid ? pullbackVwap : na, "AVWAP Pullback Line", color=avwapColor, linewidth=2)
+
+// AVWAP Bands
+plot(isAvwapPullbackMode and showAvwapBands and avwapPullbackValid ? pullbackUpperBand : na, "AVWAP Upper Band", color=color.new(color.teal, 70), style=plot.style_linebr)
+plot(isAvwapPullbackMode and showAvwapBands and avwapPullbackValid ? pullbackLowerBand : na, "AVWAP Lower Band", color=color.new(color.teal, 70), style=plot.style_linebr)
+
+// Debug table
+var table debugTable = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80))
+if vwapDebug and barstate.islast
+    table.cell(debugTable, 0, 0, isAvwapPullbackMode ? "AVWAP Pullback Debug" : "VWAP Debug", text_color=color.white, text_size=size.small)
+    table.cell(debugTable, 1, 0, "", text_color=color.white)
+    table.cell(debugTable, 0, 1, "Mode:", text_color=color.gray, text_size=size.tiny)
+    table.cell(debugTable, 1, 1, structMode, text_color=color.orange, text_size=size.tiny)
+    table.cell(debugTable, 0, 2, "Anchor Bar:", text_color=color.gray, text_size=size.tiny)
+    table.cell(debugTable, 1, 2, str.tostring(isAvwapPullbackMode ? avwapAnchorBarIdx : vwapAnchorBar), text_color=color.orange, text_size=size.tiny)
+    table.cell(debugTable, 0, 3, "VWAP:", text_color=color.gray, text_size=size.tiny)
+    table.cell(debugTable, 1, 3, str.tostring(isAvwapPullbackMode ? pullbackVwap : anchoredVwap, format.mintick), text_color=color.teal, text_size=size.tiny)
+    table.cell(debugTable, 0, 4, "Undercut Active:", text_color=color.gray, text_size=size.tiny)
+    table.cell(debugTable, 1, 4, str.tostring(isAvwapPullbackMode ? avwapUndercutActive : undercutOccurred), text_color=color.orange, text_size=size.tiny)
+    table.cell(debugTable, 0, 5, "% from VWAP:", text_color=color.gray, text_size=size.tiny)
+    currentVwap = isAvwapPullbackMode ? pullbackVwap : anchoredVwap
+    pctFromVwap = not na(currentVwap) and currentVwap > 0 ? ((close - currentVwap) / currentVwap) * 100 : 0.0
+    table.cell(debugTable, 1, 5, str.tostring(pctFromVwap, "#.2") + "%", text_color=pctFromVwap >= 0 ? color.green : color.red, text_size=size.tiny)
+
+// Stop lines
+var line[] activeStopLines = array.new_line()
+
+if signal
+    lblMode = isAvwapPullbackMode ? "AVWAP Pullback" : "U&R (" + structMode + ")"
+    activeVwapForLabel = isAvwapPullbackMode ? pullbackVwap : vwapAtSignal
+    lblStr1 = lblMode + "\nEntry: " + str.tostring(entryPrice, format.mintick)
+    lblStr2 = "\nStop: " + str.tostring(stopPrice, format.mintick) + "\nRisk: " + str.tostring(riskPct, "#.2") + "%"
+    lblStr3 = "\nClose: " + str.tostring(closePctVal, "#") + "% Rng"
+    lblStr4 = not na(activeVwapForLabel) ? "\nVWAP: " + str.tostring(activeVwapForLabel, format.mintick) : ""
+    
+    lblColor = isAvwapPullbackMode ? color.teal : color.blue
+    label.new(bar_index, high, text=lblStr1 + lblStr2 + lblStr3 + lblStr4, style=label.style_label_down, color=lblColor, textcolor=color.white, size=size.small)
+    
+    newLine = line.new(bar_index, stopPrice, bar_index + 5, stopPrice, color=color.green, style=line.style_solid, width=2)
+    array.push(activeStopLines, newLine)
+    
+    if array.size(activeStopLines) > 50
+        oldLine = array.shift(activeStopLines)
+        line.delete(oldLine)
+
+if array.size(activeStopLines) > 0
+    for i = array.size(activeStopLines) - 1 to 0
+        l = array.get(activeStopLines, i)
+        lineAge = bar_index - line.get_x1(l)
+        if lineAge > maxLineAge
+            line.delete(l)
+            array.remove(activeStopLines, i)
+            continue 
+        linePrice = line.get_y1(l)
+        if close < linePrice
+            line.set_color(l, color.red)
+            line.set_style(l, line.style_dashed)
+            line.set_x2(l, bar_index)
+            array.remove(activeStopLines, i)
+        else
+            line.set_x2(l, bar_index)
+
+
+// ==========================================
+// 13. PINE SCREENER OUTPUTS
+// ==========================================
+// These outputs enable scanning in TradingView's Pine Screener
+
+// --- Universal Signal Outputs ---
+plot(signal ? 1 : 0, title="SCR: Signal (Any)", display=display.none)
+plot(signal ? close : 0, title="SCR: Entry Price", display=display.none)
+plot(riskPct, title="SCR: Risk %", display=display.none)
+plot(closePctVal, title="SCR: Close Strength %", display=display.none)
+plot(volOk ? 1 : 0, title="SCR: Vol Valid", display=display.none)
+plot(volZ, title="SCR: Vol Z-Score", display=display.none)
+
+// --- Standard U&R Specific ---
+plot(signalStd ? 1 : 0, title="SCR: U&R Signal", display=display.none)
+plot(signalStd ? depthCalc : 0.0, title="SCR: Undercut Depth %", display=display.none)
+plot(signalStd and not na(vwapAtSignal) and vwapAtSignal > 0 ? ((close - vwapAtSignal) / vwapAtSignal) * 100 : 0, title="SCR: % Above VWAP (Std)", display=display.none)
+plot(signalStd ? structureLow : 0, title="SCR: Structure Floor", display=display.none)
+
+// --- AVWAP Pullback Specific ---
+plot(signalAvwap ? 1 : 0, title="SCR: AVWAP Pullback Signal", display=display.none)
+plot(avwapPullbackValid ? pullbackVwap : 0, title="SCR: AVWAP Level", display=display.none)
+
+// % Distance from AVWAP (key for scanning pullbacks)
+pctFromAvwap = avwapPullbackValid and pullbackVwap > 0 ? ((close - pullbackVwap) / pullbackVwap) * 100 : 0.0
+plot(pctFromAvwap, title="SCR: % from AVWAP", display=display.none)
+
+// Setup Detection for Screener (scan for forming setups)
+avwapSetupForming = isAvwapPullbackMode and avwapUndercutActive and not signalAvwap
+plot(avwapSetupForming ? 1 : 0, title="SCR: AVWAP Setup Forming", display=display.none)
+
+// Approaching AVWAP (within 2% above)
+approachingAvwap = avwapPullbackValid and pctFromAvwap > 0 and pctFromAvwap <= 2.0
+plot(approachingAvwap ? 1 : 0, title="SCR: Approaching AVWAP", display=display.none)
+
+// At or Below AVWAP (potential entry zone)
+atOrBelowAvwap = avwapPullbackValid and pctFromAvwap <= 0
+plot(atOrBelowAvwap ? 1 : 0, title="SCR: At/Below AVWAP", display=display.none)
+
+// AVWAP Breach Depth
+plot(avwapBreachDepth, title="SCR: AVWAP Breach Depth %", display=display.none)
+
+// Volume Contraction Status
+plot(volContracted ? 1 : 0, title="SCR: Vol Contracted", display=display.none)
+
+// Trend Status
+plot(trendOk ? 1 : 0, title="SCR: Trend OK", display=display.none)
+
+
+// ==========================================
+// 14. ALERTS
+// ==========================================
+alertcondition(signal, title="U&R V18 Signal (Any)", message="U&R/AVWAP Setup Detected")
+alertcondition(signalStd, title="U&R Standard Signal", message="U&R Standard Setup Detected")
+alertcondition(signalAvwap, title="AVWAP Pullback Signal", message="AVWAP Pullback Entry Detected")
+alertcondition(avwapSetupForming, title="AVWAP Setup Forming", message="AVWAP Pullback Setup Forming - Price Below AVWAP")
+alertcondition(approachingAvwap, title="Approaching AVWAP", message="Price Approaching AVWAP (within 2%)")
